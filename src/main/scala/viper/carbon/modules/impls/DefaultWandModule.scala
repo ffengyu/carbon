@@ -16,8 +16,10 @@ import viper.carbon.utility.FractionsDetector
 import viper.silver.ast.utility.Expressions
 import viper.silver.ast.{FullPerm, MagicWand, MagicWandStructure}
 import viper.silver.cfg.silver.CfgGenerator.EmptyStmt
-import viper.silver.verifier.{PartialVerificationError, VerificationError, reasons}
+import viper.silver.verifier.{PartialVerificationError, VerificationError, reasons, errors}
 import viper.silver.{ast => sil}
+
+import scala.collection.mutable.ListBuffer
 
 class
 DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent with DefinednessComponent{
@@ -75,7 +77,9 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
 
   //use this to generate unique names for states
   private val names = new BoogieNameGenerator()
-
+  private val inverseFuncs = ListBuffer[Func]()
+  private val rangeFuncs = ListBuffer[Func]()
+  private val neverTrigFuncs = ListBuffer[Func]()
 
   // states variables
   var OPS: StateRep = null
@@ -135,8 +139,16 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
         Axiom(MaybeForall(args, Trigger(f0),heapModule.isPredicateField(f0).not)) ++
         Axiom(MaybeForall(args, Trigger(f2),heapModule.isPredicateField(f2).not)) ++
         Axiom(MaybeForall(args, Trigger(f3), f1 === f3))
-    }).flatten[Decl].toSeq
-
+    }).flatten[Decl].toSeq ++ {
+      MaybeCommentedDecl("Function for trigger used in checks inside wand which are never triggered",
+        neverTrigFuncs.toSeq)
+    } ++ {
+      MaybeCommentedDecl("Functions used as inverse of receiver expressions in quantified permissions inside wand during inhale and exhale",
+        inverseFuncs.toSeq)
+    } ++ {
+      MaybeCommentedDecl("Functions used to represent the range of the projection of each QP instance onto its receiver expressions for quantified permissions inside wand during inhale and exhale",
+        rangeFuncs.toSeq)
+    }
   /*
    * method returns the boogie predicate which corresponds to the magic wand shape of the given wand
    * if the shape hasn't yet been recorded yet then it will be stored
@@ -294,6 +306,115 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
   }
 
 
+  private def renamedLocalValueExp(vs: Seq[sil.LocalVarDecl], exp: sil.Exp): (Seq[sil.LocalVarDecl],
+    Seq[LocalVarDecl], Seq[LocalVarDecl], sil.Exp, sil.AccessPredicate) = {
+    val vsFresh = vs.map(v => mainModule.env.makeUniquelyNamed(v))
+    vsFresh.foreach(vFresh => mainModule.env.define(vFresh.localVar))
+    val translatedLocalDecls = vsFresh.map(v => mainModule.translateLocalVarDecl(v))
+    val renamedExp = Expressions.renameVariables(exp, vs.map(v => v.localVar), vsFresh.map(vFresh => vFresh.localVar))
+    val recvExp: sil.AccessPredicate = renamedExp match {
+      case sil.Implies(_, recv: sil.AccessPredicate) => recv
+      case other: sil.AccessPredicate => other
+    }
+    val qpValDecls = recvExp match {
+      case sil.FieldAccessPredicate(loc@sil.FieldAccess(recv, _), _) =>
+        Seq(LocalVarDecl(Identifier("o")(transferNamespace), heapModule.refType))
+      case sil.PredicateAccessPredicate(sil.PredicateAccess(args, predname), _) =>
+        val formalArgs = program.findPredicate(predname).formalArgs.map(mainModule.env.makeUniquelyNamed)
+        formalArgs.map(_.localVar).map(mainModule.env.define)
+        val formalArgDecls = formalArgs.map(mainModule.translateLocalVarDecl)
+        formalArgs.map(_.localVar).map(mainModule.env.undefine)
+        formalArgDecls
+    }
+    (vsFresh, translatedLocalDecls, qpValDecls, renamedExp, recvExp)
+  }
+
+  private def reduceForOne[T](cond: Node => Boolean, get: Node => T, default: T, target: Node): T =
+    target.reduce((node: Node, subNodes: Seq[T]) => node match {
+      case n: T if cond(n) => get(n)
+      case _ =>
+        val targets = subNodes.filter(!_.equals(default))
+        if (targets.isEmpty) default else targets.head
+    })
+
+  private def validTriggerOrAdd(trigs: Seq[Trigger], find: Seq[Exp],add: Exp): Seq[Trigger] = {
+    trigs.map(trig => if(reduceForOne(n => find.contains(n), _ => true, false, trig)) trig else Trigger(trig.exps ++ add))
+  }
+
+  def quantifyQPAssumes(QPAssumes: Stmt, vsFresh: Seq[sil.LocalVarDecl],translatedLocalDecls: Seq[LocalVarDecl],
+                        qpValDecls: Seq[LocalVarDecl]): (Stmt, FuncApp, ListBuffer[FuncApp])= {
+    val t: LocalVar = heapModule.currentHeap.head.asInstanceOf[LocalVar]
+    val decl = LocalVarDecl(t.name, t.typ)
+    val H_h: Exp = MapSelect(H, Seq(t))
+    val H_temp_h: Exp = MapSelect(H_temp, Seq(t))
+    val M_h: Exp = MapSelect(M, Seq(t))
+    val M_temp_h: Exp = MapSelect(M_temp, Seq(t))
+
+    val QPMask = reduceForOne(
+      { case HavocImpl(vars) if !vars.isEmpty && vars.head.name.name.startsWith("QPMask") => true; case _ => false },
+      { case HavocImpl(vars) => vars.head }, FalseLit(), QPAssumes)
+
+    def indepFieldStmt(v: LocalVarDecl) = v.typ match {
+      case NamedType("Field", _) => true
+      case _ => false
+    }
+
+    val tempMask = permModule.currentMask(0)
+    val quantifyOverTempHeapAndGoodHeap: PartialFunction[Node, Node] = {
+      // add !H[h] to independent objects or predicate
+      case Forall(expVars, trigger, BinExp(UnExp(Not, lft), Implies, rht), tvs)  =>
+        Forall(Seq(decl) ++ expVars, validTriggerOrAdd(trigger, Seq(t, QPMask, tempMask), H_h), (H_h && lft).not ==> rht, tvs).replace(QPMask, M_temp_h).replace(tempMask, M_h)
+      // no H[h] to independent field
+      case Forall(expVars, trigger, BinExp(lft, Implies, rht), tvs) if indepFieldStmt(expVars.last) =>
+        Forall(Seq(decl) ++ expVars, validTriggerOrAdd(trigger, Seq(t, QPMask, tempMask), H_h), lft ==> rht, tvs).replace(QPMask, M_temp_h).replace(tempMask, M_h)
+      // add H[h] to target object and field
+      case Forall(expVars, trigger, BinExp(lft, Implies, rht), tvs) =>
+        Forall(Seq(decl) ++ expVars, validTriggerOrAdd(trigger, Seq(t, QPMask, tempMask), H_h), (H_h && lft) ==> rht, tvs).replace(QPMask, M_temp_h).replace(tempMask, M_h)
+      // add H[h] to target object and field and !H[h] to independent object
+      case Forall(expVars, trigger, BinExp(BinExp(llft, Implies, lrht), And, BinExp(UnExp(Not, rlft), Implies, rrht)), tvs) =>
+        Forall(Seq(decl) ++ expVars, validTriggerOrAdd(trigger, Seq(t, QPMask, tempMask), H_h), ((H_h && llft) ==> lrht) && ((H_h && rlft).not ==> rrht), tvs).replace(QPMask, M_temp_h).replace(tempMask, M_h)
+    }
+
+    def unrelatedCheck(n: Node) = n match {
+      case Assume(FuncApp(_, Seq(`t`, _), _)) => true
+      case HavocImpl(Seq(`QPMask`)) => true
+      case Assign(_, `QPMask`) => true
+      case _ => false
+    }
+
+    var rangeFunApp: FuncApp = null
+    val invFunApps = ListBuffer[FuncApp]()
+    val invRecvFuncNames = ListBuffer[String]()
+    var qpRangeFuncName: String = null
+    var neverTrigFuncName: String = null
+    val replaceFuncsAndStore: PartialFunction[Node, Node] = {
+      case all@FuncApp(Identifier(name, ns), args, typ) =>
+        if (name.startsWith("qpRange") && qpRangeFuncName != name) {
+          qpRangeFuncName = name
+          rangeFuncs.append(Func(Identifier(name ++ "InWand")(ns), Seq(decl) ++ qpValDecls, typ))
+          rangeFunApp = FuncApp(Identifier(name ++ "InWand")(ns), Seq(t) ++ qpValDecls.map(_.l), typ)
+        } else if (name.startsWith("invRecv") && !invRecvFuncNames.contains(name)) {
+          invRecvFuncNames.append(name)
+          inverseFuncs.append(Func(Identifier(name ++ "InWand")(ns), Seq(decl) ++ qpValDecls, typ))
+          invFunApps.append(FuncApp(Identifier(name ++ "InWand")(ns), Seq(t) ++ qpValDecls.map(_.l), typ));
+        } else if (name.startsWith("neverTriggered") && neverTrigFuncName != name) {
+          neverTrigFuncName = name
+          neverTrigFuncs.append(Func(Identifier(name ++ "InWand")(ns), Seq(decl) ++ translatedLocalDecls, typ))
+        }
+        if (name.startsWith("qpRange") || name.startsWith("invRecv") || name.startsWith("neverTriggered")) {
+          FuncApp(Identifier(name ++ "InWand")(ns), Seq(t) ++ args, typ)
+        } else {
+          all
+        }
+    }
+    (QPAssumes
+      .reduce[Stmt]((node: Node, subStmts: Seq[Stmt]) => node match {
+        case s@CommentBlock(_, stmt) if reduceForOne(unrelatedCheck _, _ => false, true, stmt) => s ++ subStmts
+        case _ => subStmts
+      })
+      .transform(quantifyOverTempHeapAndGoodHeap andThen (_.transform(replaceFuncsAndStore)(_ => true)))(), rangeFunApp, invFunApps)
+  }
+
   def inhaleLHS(A: sil.Exp, pc: Exp = TrueLit()): Stmt = {
 
     val (_, state) = stateModule.freshTempState("temp")
@@ -309,7 +430,6 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
         case _ if A.isPure =>
           val e: Exp = expModule.translateExp(A)
           val asm: Exp = Forall(Seq(decl), Trigger(H_temp_h), H_temp_h <==> (H_h && (pc ==> e)))
-          //println(asm)
           MaybeCommentBlock("inhaling pure expression for all states",
             Seq(Havoc(H_temp), Assume(asm), Assign(H, H_temp)))
         case sil.And(a, b) => Seqn(Seq(inhaleLHS(a, pc), inhaleLHS(b, pc)))
@@ -338,6 +458,14 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
         case sil.CondExp(cond, a, b) =>
           val tcond = expModule.translateExp(cond)
           Seqn(Seq(inhaleLHS(a, pc && tcond), inhaleLHS(b,  pc && UnExp(Not, tcond))))
+        case qp@sil.Forall(vs, triggers, exp) =>
+          val QPAssumes = inhaleModule.inhale(Seq((qp, errors.InhaleFailed(sil.Inhale(qp)()))), null)
+          val (vsFresh, translatedLocalDecls, qpValDecls, _, _) = renamedLocalValueExp(vs, exp)
+          val (update_mask, _, _) = quantifyQPAssumes(QPAssumes, vsFresh, translatedLocalDecls, qpValDecls)
+          val same_mask: Exp = Forall(Seq(decl), Seq(Trigger(M_temp_h), Trigger(M_h)), UnExp(Not, pc) ==> (M_temp_h === M_h))
+          vsFresh.foreach(vFresh => mainModule.env.undefine(vFresh.localVar))
+          MaybeCommentBlock("inhaling quantified location permission (heap loc or predicate)",
+            Seq(Havoc(H_temp), Havoc(M_temp), update_mask, Assume(same_mask), updateValid(H_h, M_temp_h, H_temp_h, decl), Assign(H, H_temp), Assign(M, M_temp)))
       }
     stateModule.replaceState(state) // go back to the original state
     r
@@ -774,6 +902,119 @@ DefaultWandModule(val verifier: Verifier) extends WandModule with StmtComponent 
         val tcond = expModule.translateExp(cond)
         stateModule.replaceState(rstate._2) // go back to the original state
         Seqn(Seq(exhaleRHS(a, mainError, cannot_use_min, pc && tcond), exhaleRHS(b, mainError, cannot_use_min, pc && UnExp(Not, tcond))))
+      case qp@sil.Forall(vs, provided_triggers, exp) =>
+        val (vsFresh, translatedLocalDecls, qpValDecls, renamedExp, recvExp) = renamedLocalValueExp(vs, exp)
+        val translatedLocals = translatedLocalDecls.map(_.l)
+        val QPAssumes = exhaleModule.exhale(Seq((qp, mainError)))
+        val (qpAssumeOverHeap, rangeFunApp, invFunApps) = quantifyQPAssumes(QPAssumes, vsFresh, translatedLocalDecls, qpValDecls)
+        // TODO: remove the string match?
+        val NoPerm = reduceForOne(
+          { case BinExp(c@Const(_), LtCmp, _) if c.name.name.startsWith("NoPerm") => true; case _ => false },
+          { case BinExp(np, _, _) => np }, FalseLit(), QPAssumes)
+        stateModule.replaceState(rstate._2)
+        val footprintCal = exhaleRHS(renamedExp, mainError, cannot_use_min, pc)
+        rstate = stateModule.freshTempState("temp")
+        def haveTempVar(n: Node, rel: Seq[Boolean]): Boolean = {
+          n match {
+            case Forall(_, _, _, _) => false
+            case Exists(_, _, _) => false
+            case lv@LocalVar(_, _) if translatedLocals.contains(lv) => true
+            case _ => rel.fold(false)(_ || _)
+          }
+        }
+        def haveMask(n: Node, rel: Seq[Boolean]): Boolean = {
+          n match {
+            case Trigger(_) => false
+            case M_h | Theta => true
+            case _ => rel.fold(false)(_ || _)
+          }
+        }
+        def haveTempMask(n: Node, rel: Seq[Boolean]): Boolean = {
+          n match {
+            case Trigger(_) => false
+            case M_temp_h => true
+            case _ => rel.fold(false)(_ || _)
+          }
+        }
+        val propertyStmts = qpAssumeOverHeap
+          .reduce[Stmt]((node: Node, subStmts: Seq[Stmt]) => node match {
+            case s@CommentBlock(_, stmt) if !stmt.reduce(haveTempMask) && !stmt.reduce(haveMask) => s ++ subStmts
+            case _ => subStmts
+          })
+        val removeStmts = qpAssumeOverHeap
+          .reduce[Stmt]((node: Node, subStmts: Seq[Stmt]) => node match {
+            case s@CommentBlock(_, stmt) if stmt.reduce(haveTempMask) => s ++ subStmts
+            case _ => subStmts
+          })
+
+        def localVarToInvFunc(exp: Exp): Exp = translatedLocals.zip(invFunApps).foldLeft(exp)((exp: Exp, t: (LocalVar, FuncApp)) => exp.replace(t._1, t._2))
+        val expPerm = expModule.translateExp(recvExp.perm)
+        /*
+        1. add qpDecl to forall variables
+        2. map recv expression to qpDecl variables by expRecvToQpVal
+        2. map local variables to invRecvs(recv's) by localVarToInvFunc
+         */
+        val quantifyOverVar: PartialFunction[Node, Node] = recvExp match {
+          case sil.FieldAccessPredicate(loc@sil.FieldAccess(recv, _), _) =>
+            val qpDecl = qpValDecls.head
+            val qpVar = qpDecl.l
+            val expRecv = expModule.translateExp(recv)
+            val expRecvToQpVal = (exp: Exp) => exp.replace(expRecv, qpVar)
+            val eqInvs = BinExp(expRecv, EqCmp, qpVar)
+            val ff = heapModule.translateLocation(loc)
+            val auto_trigger = Trigger(MapSelect(M_h, qpVar ++ ff))
+            val quantifyOverVar: PartialFunction[Node, Node] = {
+              // target object and field
+              case Forall(vars, triggers, exp@BinExp(lft, Implies, rht), tvs) if exp.reduce(haveTempVar) && exp.reduce(haveMask) =>
+                val newLft = BinExp(lft, And, BinExp(BinExp(NoPerm, LtCmp, expPerm), And, rangeFunApp))
+                Forall(qpDecl ++ vars, triggers.map(x => Trigger(x.exps ++ auto_trigger.exps)), localVarToInvFunc(newLft ==> (eqInvs && expRecvToQpVal(rht))), tvs)
+              // independent object and field
+              case Forall(vars, triggers, exp@BinExp(lft, Implies, rht), tvs) if exp.reduce(haveTempVar) =>
+                Forall(vars, triggers.map(x => Trigger(x.exps ++ auto_trigger.exps)), localVarToInvFunc(exp), tvs)
+              // minimum guarantee
+              case Forall(vars, triggers, min@BinExp(Exists(lv, lt, lft), Implies, Exists(rv, rt, rht)), tvs) =>
+                Forall(vars, triggers, localVarToInvFunc(min), tvs)
+            }
+            quantifyOverVar
+          case sil.PredicateAccessPredicate(sil.PredicateAccess(args, predname), _) =>
+            val qpDecls = qpValDecls
+            val qpVars = qpDecls.map(_.l)
+            val expRecvs = args.map(expModule.translateExp)
+            val expRecvToQpVal = (exp: Exp) => expRecvs.zip(qpVars).foldLeft(exp)((inExo: Exp, t: (Exp, LocalVar)) => inExo.replace(t._1, t._2))
+            val eqInvs = expRecvs.tail.zip(qpVars.tail).foldLeft(BinExp(expRecvs.head, EqCmp, qpVars.head))((inExp: Exp, t: (Exp, LocalVar)) => BinExp(inExp, And, BinExp(t._1, EqCmp, t._2)))
+            val ff = heapModule.translateLocation(program.findPredicate(predname), qpVars)
+            val auto_trigger = Trigger(MapSelect(M_h, heapModule.translateNull ++ ff))
+            val quantifyOverVar: PartialFunction[Node, Node] = {
+              // target object and field
+              case Forall(vars, triggers, exp@BinExp(lft, Implies, rht), tvs) if exp.reduce(haveTempVar) && exp.reduce(haveMask) =>
+                val newLft = (lft && (NoPerm < expPerm)) &&  rangeFunApp
+                Forall(qpDecls ++ vars, triggers.map(x => Trigger(x.exps ++ auto_trigger.exps)), localVarToInvFunc(newLft ==> (eqInvs && expRecvToQpVal(rht))), tvs)
+              // independent object
+              case Forall(vars, triggers, exp@BinExp(Forall(inVars, inTriggers, BinExp(inLft, Implies, inRht), inTvs), Implies, rht), tvs) if exp.reduce(haveTempVar) =>
+                Forall(qpDecls, triggers.map(t => Trigger(t.exps.map(expRecvToQpVal))), Forall(inVars, inTriggers, inLft ==> eqInvs.not, inTvs) ==> expRecvToQpVal(rht), tvs).replace(vars.head.l, heapModule.translateNull)
+              // independent filed
+              case Forall(vars, triggers, exp@BinExp(BinExp(_, NeCmp, _), Implies, rht), tvs) if exp.reduce(haveTempVar) =>
+                val newLft = ((vars.head.l !== heapModule.translateNull) || heapModule.isPredicateField(vars.last.l).not) || (heapModule.getPredicateId(vars.last.l) !== IntLit(heapModule.getPredicateId(predname)))
+                Forall(vars, triggers.map(t => Trigger(t.exps.map(expRecvToQpVal))), newLft ==> expRecvToQpVal(rht), tvs)
+              // minimum guarantee
+              case Forall(vars, triggers, min@BinExp(Exists(_, _, _), Implies, Exists(_, _, _)), tvs) =>
+                Forall(qpDecls, triggers.map(t => Trigger(t.exps.map(expRecvToQpVal))), localVarToInvFunc(min.replace(heapModule.translateNull === vars.head.l, eqInvs)), tvs)
+
+            }
+            quantifyOverVar
+        }
+        val footprintCalOverVar = footprintCal
+          .reduce[Stmt]((node: Node, subStmts: Seq[Stmt]) => node match {
+            case s@If(_, _, _) => MaybeCommentBlock("exhaling heap location permission", s)
+            case s@Assert(_, _) => MaybeCommentBlock("removing permission from the states",s)
+            case _ => subStmts
+          }).transform(quantifyOverVar)()
+        val ret = Seq(propertyStmts, footprintCalOverVar,
+                          Havoc(M_temp), removeStmts, Assign(M, M_temp),
+                          Havoc(Theta_temp), removeStmts.replace(M, Theta).replace(M_temp, Theta_temp), Assign(Theta, Theta_temp))
+        vsFresh.foreach(vFresh => mainModule.env.undefine(vFresh.localVar))
+        stateModule.replaceState(rstate._2)
+        MaybeCommentBlock("exhaling wand", ret)
     }
   }
 

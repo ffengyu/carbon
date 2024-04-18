@@ -219,7 +219,7 @@ class DefaultStmtModule(val verifier: Verifier) extends StmtModule with SimpleSt
         /* Handled by loop module, since the loop module decides whether the goto should be translated as a goto. */
         Nil
       case pa@sil.Package(wand, proof) => {
-        checkDefinedness(wand, errors.MagicWandNotWellformed(wand), insidePackageStmt = insidePackageStmt)
+        checkDefinedness(wand, errors.MagicWandNotWellformed(wand), insidePackageStmt = insidePackageStmt) ++
         translatePackage(pa, errors.PackageFailed(pa), statesStack, allStateAssms, insidePackageStmt)
       }
       case a@sil.Apply(wand) =>

@@ -462,12 +462,12 @@ class DefaultExpModule(val verifier: Verifier) extends ExpModule with Definednes
     val defStateRHS = stateModule.state
 
     stateModule.replaceState(defStateLHS)
-    val lhs = initStmtLHS ++ checkDefinednessOfSpecAndInhale(e.left, error)
+    val lhs = initStmtLHS ++ stateModule.assumeGoodState ++ checkDefinednessOfSpecAndInhale(e.left, error)
     val lhsID = wandModule.getNewLhsID() // identifier for the lhs of the wand to be referred to later when 'old(lhs)' is used
     val defineLHS = stmtModule.translateStmt(sil.Label("lhs"+lhsID, Nil)(e.pos, e.info))
     wandModule.pushToActiveWandsStack(lhsID)
     stateModule.replaceState(defStateRHS)
-    val rhs = initStmtRHS ++ checkDefinednessOfSpecAndInhale(e.right, error)
+    val rhs = initStmtRHS ++ stateModule.assumeGoodState ++checkDefinednessOfSpecAndInhale(e.right, error)
     wandModule.popFromActiveWandsStack()
     stateModule.replaceState(curState)
     NondetIf(lhs ++ defineLHS ++ rhs ++ Assume(FalseLit()))
